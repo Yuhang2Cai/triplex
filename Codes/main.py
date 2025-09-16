@@ -115,8 +115,42 @@ if __name__ == '__main__':
     np.save('/scratch/user/jungangc/PICNN-2phase/PICNN-2phaseflow-constBHP-64by64-heter-TransferLearning-50stepsby2-final/Codes/model/train_loss', train_loss)  
     print('The training time is: ', (end-start))
 
+    """主程序函数"""
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
 
+    # 1. 数据加载和预处理
+    print("1. 加载和预处理数据...")
+    data = pd.read_csv('combined_all_t_p.csv')
 
+    # 修改：去掉最后一列'imotor'，只保留前三列作为输入
+    X = data.drop(['pOut', 'iMotor'], axis=1)  # 去掉目标列和不需要的列
+    Y = data['pOut']
+    #物理参数
+    V = 2 * np.exp(-4),
+    bulk_modulus_model = 'const',
+    air_dissolution_model = 'off',
+    rho_L_atm = 851.6,
+    beta_L_atm = 1.46696e+03,
+    beta_gain = 0.2,
+    air_fraction = 0.005,
+    rho_g_atm = 1.225,
+    polytropic_index = 1.0,
+    p_atm = 0.101325,
+    p_crit = 3,
+    p_min = 1
+
+    start = time.time()
+    train_loss, outputs = train(source_BHP, Qinj, Tmap, p0, sw0, n_iters_adam,
+                                lr_adam, dt, Rate_vec[:, :steps_net * dt:dt], BHP_vec[:, :steps_net * dt:dt], Perm,
+                                steps_net, steps_sim)
+    end = time.time()
+
+    np.save(
+        '/scratch/user/jungangc/PICNN-2phase/PICNN-2phaseflow-constBHP-64by64-heter-TransferLearning-50stepsby2-final/Codes/model/train_loss',
+        train_loss)
+    print('The training time is: ', (end - start))
 
 
 

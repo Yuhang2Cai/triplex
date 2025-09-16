@@ -15,6 +15,20 @@ from system.twophaseflow_compute_source import compute_source
 from system.twophaseflow_compute_accumulation import compute_accumulation
 from system.twophaseflow_compute_transmisibility import compute_transmisibility
 
+# 物理参数
+V = 2 * np.exp(-4)
+bulk_modulus_model = 'const'
+air_dissolution_model = 'off'
+rho_L_atm = 851.6
+beta_L_atm = 1.46696e+03
+beta_gain = 0.2
+air_fraction = 0.005
+rho_g_atm = 1.225
+polytropic_index = 1.0
+p_atm = 0.101325
+p_crit = 3
+p_min = 1
+
 
 class Conv1dDerivative(nn.Module):
     def __init__(self, DerFilter, resol, kernel_size=3, name=''):
@@ -27,119 +41,219 @@ class Conv1dDerivative(nn.Module):
         self.kernel_size = kernel_size
 
         self.padding = int((kernel_size - 1) / 2)
-        self.filter = nn.Conv1d(self.input_channels, self.output_channels, self.kernel_size, 
-            1, padding=0, bias=False)
-        
+        self.filter = nn.Conv1d(self.input_channels, self.output_channels, self.kernel_size,
+                                1, padding=0, bias=False)
+
         # Fixed gradient operator
-        self.filter.weight = nn.Parameter(torch.FloatTensor(DerFilter), requires_grad=False)  
+        self.filter.weight = nn.Parameter(torch.FloatTensor(DerFilter), requires_grad=False)
 
     def forward(self, input):
         derivative = self.filter(input)
         return derivative / self.resol
-    
+
+
 class loss_generator(nn.Module):
     ''' Loss generator for physics loss '''
 
     def __init__(self, delta_t):
         ''' Construct the derivatives, X = Width, Y = Height '''
-       
+
         super(loss_generator, self).__init__()
 
         # temporal derivative operator
         self.dt = Conv1dDerivative(
-            DerFilter = [[[-1, 0, 1]]],
-            resol = (delta_t *2),
-            kernel_size = 3,
-            name = 'partial_t').cuda()
+            DerFilter=[[[-1, 0, 1]]],
+            resol=(delta_t * 2),
+            kernel_size=3,
+            name='partial_t').cuda()
 
-    def get_phy_Loss(self, p_prev, sw_prev, xp, xs, delta_t, Qinj_schedule, BHP_schedule, Perm, tsteps):
+    def mixture_density_derivative(self, p, bulk_modulus_model, air_dissolution_model,
+                                   rho_L_atm, beta_L_atm, beta_gain, air_fraction,
+                                   rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
+        rho_L_atm = torch.tensor(rho_L_atm, dtype=p.dtype, device=p.device)
+        beta_L_atm = torch.tensor(beta_L_atm, dtype=p.dtype, device=p.device)
+        beta_gain = torch.tensor(beta_gain, dtype=p.dtype, device=p.device)
+        air_fraction = torch.tensor(air_fraction, dtype=p.dtype, device=p.device)
+        rho_g_atm = torch.tensor(rho_g_atm, dtype=p.dtype, device=p.device)
+        polytropic_index = torch.tensor(polytropic_index, dtype=p.dtype, device=p.device)
+        p_atm = torch.tensor(p_atm, dtype=p.dtype, device=p.device)
+        p_crit = torch.tensor(p_crit, dtype=p.dtype, device=p.device)
+        p_min = torch.tensor(p_min, dtype=p.dtype, device=p.device)
+        # Determine p_used
+        p_used = p if p >= p_min else p_min
 
-        # Initialize the 2 phase porous flow system
-        Geometry, Discretization, Fluid, Rock, Wells, Conditions, Constants, FullSolution = INITIALIZE(Qinj_schedule, BHP_schedule, Perm, tsteps)
-        # print("rocksize: " + str(torch.tensor(Rock).shape))
-        # print("Wellssize: " + str(torch.tensor(Wells).shape))
-        Discretization, Wells, FullSolution = pre_processing(Geometry, Discretization, Rock, Wells, Conditions, Constants, FullSolution)
-        Rock = twophaseflow_geo_avg(Discretization, Rock, FullSolution, Constants)
-#         # spatial derivatives
-        # temporal derivative - p
-        # print("output: ", output.size())
-        p_curr = xp
-        # print('p_curr', p_curr)
-        p_prev = p_prev
-        # p_next = output[2:, 0:1, :, :]
-        # p_diff_t = (p_next-2*p_curr+p_prev)/(2*delta_t)
-        p_diff_t = (p_curr-p_prev)/delta_t
-        
-        sw_curr = xs
-        sw_prev = sw_prev
-        # sw_next = output[2:, 1:2, :, :]
-        # sw_diff_t = (sw_next-2*sw_curr+sw_prev)/(2*delta_t)
-        sw_diff_t = (sw_curr-sw_prev)/delta_t
-        
-        lent = p_curr.shape[0]
-        lenx = p_curr.shape[3]
-        leny = p_curr.shape[2]
+        # Calculate theta (fraction of air entrained)
+        if air_dissolution_model == 'off':
+            theta = 1.0
+        else:
+            if p_used <= p_atm:
+                theta = 1.0
+            elif p_used >= p_crit:
+                theta = 0.0
+            else:
+                L = p_crit - p_atm
+                x = (p_used - p_atm) / L
+                theta = 1 - 3 * x ** 2 + 2 * x ** 3
 
-        # reshape current pressure 
-        p_conv1d = p_curr.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
-        p_vec = p_conv1d.reshape(lenx*leny,1,lent)
-        P_out_vec = p_vec.permute(2,1,0)     # [step, c, X*Y]
-        
-        # reshape current saturation
-        sw_conv1d = sw_curr.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
-        sw_vec = sw_conv1d.reshape(lenx*leny,1,lent)
-        Sw_out_vec = sw_vec.permute(2,1,0)   # [step, c, X*Y]
-        
-        # temporal derivative - p_t
-        p_conv1d = p_diff_t.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
-        p_dt_vec = p_conv1d.reshape(lenx*leny,1,lent)
-        P_dt_vec = p_dt_vec.permute(2,1,0)    # [step, c, X*Y]
-        
-        # temporal derivative - sw_t
-        sw_conv1d = sw_diff_t.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
-        sw_dt_vec = sw_conv1d.reshape(lenx*leny,1,lent)
-        Sw_dt_vec = sw_dt_vec.permute(2,1,0)     # [step, c, X*Y]
+        # Calculate dtheta_dp (derivative of theta)
+        if air_dissolution_model == 'off':
+            dtheta_dp = 0.0
+        else:
+            if p_used <= p_atm or p_used >= p_crit:
+                dtheta_dp = 0.0
+            else:
+                L = p_crit - p_atm
+                dtheta_dp = 6 * (p_used - p_atm) * (p_used - p_crit) / (L ** 3)
 
-        # pressure and saturation for updating properties
-        # FullSolution.Pcurrent =  P_prev_vec.squeeze().t()
-        # FullSolution.Swcurrent = Sw_prev_vec.squeeze().t()
-        FullSolution.Pcurrent =  P_out_vec.squeeze(dim=1).t()
-        FullSolution.Swcurrent = Sw_out_vec.squeeze(dim=1).t()
-        
-        # print(FullSolution.Pcurrent.size())
-        Fluid    = update_fluid_property(Fluid,FullSolution) 
-        # print(Fluid.bo)
-        Rock  = update_rock_property(Rock,FullSolution)
-        # print(Rock.kro)
-        Mobility = compute_mobility(Fluid,Rock)
-        # print('Mobility:', Mobility.fro)
-        # print("Mobility.size" + str(Mobility))
-        # print("Wells.size" + str(Wells))
-        Wells   = compute_source(Discretization, Mobility, Wells)
-        # print('wells', Wells.Qo[0])
-        Accumulation = compute_accumulation(Discretization, Constants, Fluid, Rock, FullSolution)
-        # print(Accumulation.Acc_op[0])
-        Transmisibility  = compute_transmisibility(Discretization, Rock, Mobility, FullSolution)
+        # Calculate p_denom
+        if air_fraction == 0:
+            p_denom = 0.0
+        else:
+            p_denom = (air_fraction / (1 - air_fraction)) * (p_atm / p_used) ** (1 / polytropic_index) * theta
 
-        Acc     = Accumulation.Acc
-        # print(Transmisibility.T.size())
-        Trans = Transmisibility.T - Wells.Q
-        q = Wells.q
-        
-        Xp = P_out_vec.squeeze(dim=1).t()
-        Xs = Sw_out_vec.squeeze(dim=1).t()
-        X = torch.vstack((Xp, Xs))
+        # Calculate p_ratio
+        if air_fraction == 0:
+            p_ratio = 0.0
+        else:
+            if air_dissolution_model == 'off':
+                p_ratio = p_denom / (p_used * polytropic_index)
+            else:
+                term1 = (air_fraction / (1 - air_fraction)) * (p_atm / p_used) ** (1 / polytropic_index)
+                term2 = (theta / (p_used * polytropic_index)) - dtheta_dp
+                p_ratio = term1 * term2
 
-        dXpdt = P_dt_vec.squeeze(dim=1).t()
-        dXsdt = Sw_dt_vec.squeeze(dim=1).t()
-        dXdt = torch.vstack((dXpdt, dXsdt))
-        
-        residual = torch.sparse.mm(Trans, X)-torch.sparse.mm(Acc, dXdt) + q
-        # print('min oil',torch.min(residual_p))
-        # print('max oil',torch.max(residual_p))
-        # print('min water',torch.min(residual_sw))
-        # print('max water',torch.max(residual_sw))
-        return residual
+        # Calculate exp_term based on conditions
+        if air_fraction == 0:
+            if bulk_modulus_model == 'const':
+                exp_term = torch.exp((p_used - p_atm) / beta_L_atm) / beta_L_atm
+            else:
+                base = 1 + beta_gain * (p_used - p_atm) / beta_L_atm
+                exponent = (-1 + 1 / beta_gain)
+                exp_term = (base ** exponent) / beta_L_atm
+        else:
+            if bulk_modulus_model == 'const':
+                with torch.no_grad():
+                    exp_term = torch.exp(-(p_used - p_atm) / beta_L_atm) / beta_L_atm
+                # exp_term = np.exp(-(p_used - p_atm) / beta_L_atm) / beta_L_atm
+            else:
+                base = 1 + beta_gain * (p_used - p_atm) / beta_L_atm
+                exponent = (-1 - 1 / beta_gain)
+                exp_term = (base ** exponent) / beta_L_atm
+
+        # Compute initial mixture density
+        rho_mix_init = rho_L_atm + rho_g_atm * (air_fraction / (1 - air_fraction))
+
+        # Final computation of drho_mix_dp
+        if air_fraction == 0:
+            drho_mix_dp = rho_L_atm * exp_term
+        else:
+            if bulk_modulus_model == 'const':
+                denominator = beta_L_atm * exp_term + p_denom
+            else:
+                beta_term = 1 + beta_gain * (p_used - p_atm) / beta_L_atm
+                denominator = beta_L_atm * exp_term * beta_term + p_denom
+            numerator = exp_term + p_ratio
+            drho_mix_dp = rho_mix_init * numerator / (denominator ** 2)
+
+        return drho_mix_dp
+
+    #     def get_phy_Loss(self, p_prev, sw_prev, xp, xs, delta_t, Qinj_schedule, BHP_schedule, Perm, tsteps):
+    #
+    #         # Initialize the 2 phase porous flow system
+    #         Geometry, Discretization, Fluid, Rock, Wells, Conditions, Constants, FullSolution = INITIALIZE(Qinj_schedule, BHP_schedule, Perm, tsteps)
+    #         # print("rocksize: " + str(torch.tensor(Rock).shape))
+    #         # print("Wellssize: " + str(torch.tensor(Wells).shape))
+    #         Discretization, Wells, FullSolution = pre_processing(Geometry, Discretization, Rock, Wells, Conditions, Constants, FullSolution)
+    #         Rock = twophaseflow_geo_avg(Discretization, Rock, FullSolution, Constants)
+    # #         # spatial derivatives
+    #         # temporal derivative - p
+    #         # print("output: ", output.size())
+    #         p_curr = xp
+    #         # print('p_curr', p_curr)
+    #         p_prev = p_prev
+    #         # p_next = output[2:, 0:1, :, :]
+    #         # p_diff_t = (p_next-2*p_curr+p_prev)/(2*delta_t)
+    #         p_diff_t = (p_curr-p_prev)/delta_t
+    #
+    #         sw_curr = xs
+    #         sw_prev = sw_prev
+    #         # sw_next = output[2:, 1:2, :, :]
+    #         # sw_diff_t = (sw_next-2*sw_curr+sw_prev)/(2*delta_t)
+    #         sw_diff_t = (sw_curr-sw_prev)/delta_t
+    #
+    #         lent = p_curr.shape[0]
+    #         lenx = p_curr.shape[3]
+    #         leny = p_curr.shape[2]
+    #
+    #         # reshape current pressure
+    #         p_conv1d = p_curr.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
+    #         p_vec = p_conv1d.reshape(lenx*leny,1,lent)
+    #         P_out_vec = p_vec.permute(2,1,0)     # [step, c, X*Y]
+    #
+    #         # reshape current saturation
+    #         sw_conv1d = sw_curr.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
+    #         sw_vec = sw_conv1d.reshape(lenx*leny,1,lent)
+    #         Sw_out_vec = sw_vec.permute(2,1,0)   # [step, c, X*Y]
+    #
+    #         # temporal derivative - p_t
+    #         p_conv1d = p_diff_t.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
+    #         p_dt_vec = p_conv1d.reshape(lenx*leny,1,lent)
+    #         P_dt_vec = p_dt_vec.permute(2,1,0)    # [step, c, X*Y]
+    #
+    #         # temporal derivative - sw_t
+    #         sw_conv1d = sw_diff_t.permute(2, 3, 1, 0)  # [height(Y), width(X), c, step]
+    #         sw_dt_vec = sw_conv1d.reshape(lenx*leny,1,lent)
+    #         Sw_dt_vec = sw_dt_vec.permute(2,1,0)     # [step, c, X*Y]
+    #
+    #         # pressure and saturation for updating properties
+    #         # FullSolution.Pcurrent =  P_prev_vec.squeeze().t()
+    #         # FullSolution.Swcurrent = Sw_prev_vec.squeeze().t()
+    #         FullSolution.Pcurrent =  P_out_vec.squeeze(dim=1).t()
+    #         FullSolution.Swcurrent = Sw_out_vec.squeeze(dim=1).t()
+    #
+    #         # print(FullSolution.Pcurrent.size())
+    #         Fluid    = update_fluid_property(Fluid,FullSolution)
+    #         # print(Fluid.bo)
+    #         Rock  = update_rock_property(Rock,FullSolution)
+    #         # print(Rock.kro)
+    #         Mobility = compute_mobility(Fluid,Rock)
+    #         # print('Mobility:', Mobility.fro)
+    #         # print("Mobility.size" + str(Mobility))
+    #         # print("Wells.size" + str(Wells))
+    #         Wells   = compute_source(Discretization, Mobility, Wells)
+    #         # print('wells', Wells.Qo[0])
+    #         Accumulation = compute_accumulation(Discretization, Constants, Fluid, Rock, FullSolution)
+    #         # print(Accumulation.Acc_op[0])
+    #         Transmisibility  = compute_transmisibility(Discretization, Rock, Mobility, FullSolution)
+    #
+    #         Acc     = Accumulation.Acc
+    #         # print(Transmisibility.T.size())
+    #         Trans = Transmisibility.T - Wells.Q
+    #         q = Wells.q
+    #
+    #         Xp = P_out_vec.squeeze(dim=1).t()
+    #         Xs = Sw_out_vec.squeeze(dim=1).t()
+    #         X = torch.vstack((Xp, Xs))
+    #
+    #         dXpdt = P_dt_vec.squeeze(dim=1).t()
+    #         dXsdt = Sw_dt_vec.squeeze(dim=1).t()
+    #         dXdt = torch.vstack((dXpdt, dXsdt))
+    #
+    #         residual = torch.sparse.mm(Trans, X)-torch.sparse.mm(Acc, dXdt) + q
+    #         # print('min oil',torch.min(residual_p))
+    #         # print('max oil',torch.max(residual_p))
+    #         # print('min water',torch.min(residual_sw))
+    #         # print('max water',torch.max(residual_sw))
+    #         return residual
+
+    def get_phy_Loss(self, p_prev, xp, dt, mdot_A):
+        dpdt = (xp - p_prev) / dt
+        physics_loss = V * self.mixture_density_derivative(
+            p_prev * 0.1, bulk_modulus_model,
+            air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain,
+            air_fraction, rho_g_atm, polytropic_index, p_atm, p_crit,
+            p_min) * dpdt - mdot_A
+
 
 class CustomLoss(nn.Module):
     def __init__(self, initial_coefficient=[0.01, 1.0]):
@@ -148,61 +262,50 @@ class CustomLoss(nn.Module):
 
     def compute_loss(self, p_prev, sw_prev, xp, xs, loss_func, delta_t, Qinj_schedule, BHP_schedule, Perm, sim_step):
         ''' calculate the phycis loss '''
-        # get physics loss
-        # mse_loss1 = nn.MSELoss()
         mse_loss1 = nn.SmoothL1Loss(beta=10.0)
-        # mse_loss1 = nn.L1Loss()
-        # mse_loss2 = nn.MSELoss()
-        # mse_loss2 = nn.SmoothL1Loss(beta=10.0)
-        # mse_loss2 = nn.L1Loss()
-        # mse_loss = nn.L1Loss()
-        # output = output *3000    # to enforce the original CNN output is between 0 to 1
-    #     f_u, f_v = loss_func.get_phy_Loss(output)
-        f_p  = loss_func.get_phy_Loss(p_prev, sw_prev, xp, xs, delta_t, Qinj_schedule, BHP_schedule, Perm, sim_step)
-        # loss_p =  mse_loss(f_p, torch.zeros_like(f_p).cuda())
-        loss_p =  mse_loss1(f_p, torch.zeros_like(f_p).cuda())
-        # loss_sw =  mse_loss2(f_sw, torch.zeros_like(f_sw).cuda())
-        # loss =  mse_loss(f_p, P_out_vec)
-
-        # loss_d = compute_loss_data(output, P_data)
+        f_p = loss_func.get_phy_Loss(p_prev, sw_prev, xp, xs, delta_t, Qinj_schedule, BHP_schedule, Perm, sim_step)
+        loss_p = mse_loss1(f_p, torch.zeros_like(f_p).cuda())
         loss = loss_p
-        # loss = self.coefficient[0]*loss_p + self.coefficient[1]*loss_sw 
+
         return loss
+
 
 def compute_loss_data(output, P_data):
     p_pred = torch.cat((output[1:-1, 0:1, 9, 9], output[1:-1, 0:1, 54, 54]), dim=1)
-    P_pred = p_pred.permute(1,0)
-    
-    P_data = P_data[:,1:]
+    P_pred = p_pred.permute(1, 0)
+
+    P_data = P_data[:, 1:]
     # mse_loss = nn.L1Loss()
     mse_loss = nn.SmoothL1Loss(beta=100.0)
     loss_data = mse_loss(P_pred, P_data).cuda()
     return loss_data
 
+
 def compute_loss_adp(output, loss_func, delta_t, epoch):
     ''' calculate the phycis loss '''
-    
+
     beta = [100, 10]
     # get physics loss
     # mse_loss = nn.MSELoss()
-    if epoch < 10000: 
+    if epoch < 10000:
         mse_loss = nn.SmoothL1Loss(beta=beta[0])
     # elif epoch >=5000 and epoch < 15000:
     #     mse_loss = nn.SmoothL1Loss(beta=beta[1])
-    else: 
+    else:
         mse_loss = nn.SmoothL1Loss(beta=beta[1])
     # mse_loss = nn.L1Loss()
     # output = output *3000    # to enforce the original CNN output is between 0 to 1
-#     f_u, f_v = loss_func.get_phy_Loss(output)
+    #     f_u, f_v = loss_func.get_phy_Loss(output)
     f_p, P_out_vec = loss_func.get_phy_Loss(output, delta_t)
-#     loss =  mse_loss(f_u, torch.zeros_like(f_u).cuda()) + mse_loss(f_v, torch.zeros_like(f_v).cuda()) 
-    loss =  mse_loss(f_p, torch.zeros_like(f_p).cuda())
+    #     loss =  mse_loss(f_u, torch.zeros_like(f_u).cuda()) + mse_loss(f_v, torch.zeros_like(f_v).cuda())
+    loss = mse_loss(f_p, torch.zeros_like(f_p).cuda())
     # loss =  mse_loss(f_p, P_out_vec)
     return loss
-    
+
+
 def compute_loss_w(output, loss_func, delta_t):
     ''' calculate the phycis loss '''
-    
+
     # # Padding x axis due to periodic boundary condition
     # # shape: [t, c, h, w]
     # output = torch.cat((output[:, :, :, -2:], output, output[:, :, :, 0:3]), dim=3)
@@ -215,16 +318,16 @@ def compute_loss_w(output, loss_func, delta_t):
     # mse_loss = nn.MSELoss()
     mse_loss = nn.L1Loss(reduction='none')
     # output = output *3000    # to enforce the original CNN output is between 0 to 1
-#     f_u, f_v = loss_func.get_phy_Loss(output)
+    #     f_u, f_v = loss_func.get_phy_Loss(output)
     f_p, P_out_vec = loss_func.get_phy_Loss(output, delta_t)
-#     loss =  mse_loss(f_u, torch.zeros_like(f_u).cuda()) + mse_loss(f_v, torch.zeros_like(f_v).cuda()) 
-    loss =  mse_loss(f_p, torch.zeros_like(f_p).cuda()).detach()     # get the abs loss tensor [1000, 1, 8192]
+    #     loss =  mse_loss(f_u, torch.zeros_like(f_u).cuda()) + mse_loss(f_v, torch.zeros_like(f_v).cuda())
+    loss = mse_loss(f_p, torch.zeros_like(f_p).cuda()).detach()  # get the abs loss tensor [1000, 1, 8192]
     lmin, lmax = torch.min(loss.view(loss.shape[0], -1), dim=1)[0], torch.max(loss.view(loss.shape[0], -1), dim=1)[0]
     lmin, lmax = lmin.reshape(loss.shape[0], 1, 1).expand(loss.shape), \
-                       lmax.reshape(loss.shape[0], 1, 1).expand(loss.shape)
-    
-    weights = 2.0 * (loss - lmin) / (lmax - lmin)    # w = a + b* (loss - min(loss))/(max(loss) - min(loss))
-    
+        lmax.reshape(loss.shape[0], 1, 1).expand(loss.shape)
+
+    weights = 2.0 * (loss - lmin) / (lmax - lmin)  # w = a + b* (loss - min(loss))/(max(loss) - min(loss))
+
     w_loss = torch.mean(torch.abs(weights * (f_p - torch.zeros_like(f_p).cuda())))
-    
+
     return w_loss

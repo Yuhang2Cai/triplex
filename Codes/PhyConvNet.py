@@ -5,7 +5,6 @@ import torch.nn as nn
 import numpy as np
 from torch.nn.utils import weight_norm
 
-from network import encoder_block_p, encoder_block_sw, decoder_block_p, decoder_block_sw, source_encoder_bhp, source_encoder_qinj
 
 # generalized version
 def initialize_weights(module):
@@ -23,21 +22,12 @@ def initialize_weights(module):
         # nn.init.constant_(module.weight, 1)
         nn.init.kaiming_normal_(module.weight.data)
         nn.init.zeros_(module.bias)
-    
+
     elif type(module) == nn.ConvTranspose2d:
         # nn.init.constant_(module.weight, 1)
         nn.init.kaiming_normal_(module.weight.data)
         nn.init.zeros_(module.bias)
-        
-# # generalized version
-# def initialize_weights(module):
-#     ''' starting from small initialized parameters '''
-#     if isinstance(module, nn.Conv2d):
-#         c = 0.1
-#         module.weight.data.xavier_normal_(module.weight)
-     
-#     elif isinstance(module, nn.Linear):
-#         module.bias.data.zero_()
+
 
 class _EncoderBlock(nn.Module):
 
@@ -89,10 +79,10 @@ class _DecoderBlock(nn.Module):
 
 
 class PhyConvNet(nn.Module):
-    def __init__(self, num_classes=1, in_channels=2, bn=False, factors=2, time_sim=1):
+    def __init__(self, num_classes=1, in_channels=3, bn=False, factors=2, time_sim=1):
         super(PhyConvNet, self).__init__()
         self.steps = time_sim
-        
+
         self.enc1 = _EncoderBlock(in_channels, 32 * factors, polling=False, bn=bn)
         self.enc2 = _EncoderBlock(32 * factors, 64 * factors, bn=bn)
         self.enc3 = _EncoderBlock(64 * factors, 128 * factors, bn=bn)
@@ -106,58 +96,17 @@ class PhyConvNet(nn.Module):
             nn.Conv2d(64 * factors, 32 * factors, kernel_size=3, padding=1, padding_mode='circular'),
             nn.BatchNorm2d(32 * factors) if bn else nn.GroupNorm(32, 32 * factors),
             nn.GELU(),
-            # nn.ReLU(),
-            # nn.Tanh(),
             nn.Conv2d(32 * factors, 32 * factors, kernel_size=1, padding=0),
             nn.BatchNorm2d(32 * factors) if bn else nn.GroupNorm(32, 32 * factors),
             nn.GELU(),
-            # nn.ReLU(),
-            # nn.Tanh(),
         )
         self.final = nn.Conv2d(32 * factors, num_classes, kernel_size=1)
         self.act = nn.Sigmoid()
-        
-        self.enc1_sw = _EncoderBlock(in_channels, 32 * factors, polling=False, bn=bn)
-        self.enc2_sw = _EncoderBlock(32 * factors, 64 * factors, bn=bn)
-        self.enc3_sw = _EncoderBlock(64 * factors, 128 * factors, bn=bn)
-        # self.enc4_sw = _EncoderBlock(128 * factors, 256 * factors, bn=bn)
-        self.polling_sw = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.center_sw = _DecoderBlock(128 * factors, 256 * factors, 128 * factors, bn=bn)
-        # self.dec4_sw = _DecoderBlock(512 * factors, 256 * factors, 128 * factors, bn=bn)
-        self.dec3_sw = _DecoderBlock(256 * factors, 128 * factors, 64 * factors, bn=bn)
-        self.dec2_sw = _DecoderBlock(128 * factors, 64 * factors, 32 * factors, bn=bn)
-        self.dec1_sw = nn.Sequential(
-            nn.Conv2d(64 * factors, 32 * factors, kernel_size=3, padding=1, padding_mode='circular'),
-            nn.BatchNorm2d(32 * factors) if bn else nn.GroupNorm(32, 32 * factors),
-            nn.GELU(),
-            # nn.ReLU(),
-            # nn.Tanh(),
-            nn.Conv2d(32 * factors, 32 * factors, kernel_size=1, padding=0),
-            nn.BatchNorm2d(32 * factors) if bn else nn.GroupNorm(32, 32 * factors),
-            nn.GELU(),
-            # nn.ReLU(),
-            # nn.Tanh(),
-        )
-        self.final_sw = nn.Conv2d(32 * factors, num_classes, kernel_size=1)
-        self.act_sw = nn.Sigmoid()
-        
+
         self.apply(initialize_weights)
 
     def forward(self, xp, xs, bhp, rate, Tmap):
-        # outputs = []
-        # xp_init = xp
-        # xs_init = xs
-        # outputs.append(torch.cat((xp, xs), dim=1))
-        # for step in range(self.steps):
-        # batch, channel, h, w = x.size()
-        # print('input size', x.size())
-
-        # bhp = source_BHP[step:step+1,...]
-        # rate = Qinj[step:step+1,...]
-        # t = Tmap[step:step+1,...]
-
-        # inputs = torch.cat((xp, xs, bhp, rate), dim = 1)
-        inputs = torch.cat((bhp, rate), dim = 1)
+        inputs = torch.cat((bhp, rate), dim=1)
         enc1 = self.enc1(inputs)
         enc2 = self.enc2(enc1)
         enc3 = self.enc3(enc2)
@@ -171,26 +120,8 @@ class PhyConvNet(nn.Module):
                                                   mode='bilinear'), enc2], 1))
         dec1 = self.dec1(torch.cat([F.interpolate(dec2, enc1.size()[-2:], align_corners=False,
                                                   mode='bilinear'), enc1], 1))
-        xp = self.final(dec1)
-        xp = self.act(xp)
-        xp =  2000+(8000-2000)*xp
-
-        enc1 = self.enc1_sw(inputs)
-        enc2 = self.enc2_sw(enc1)
-        enc3 = self.enc3_sw(enc2)
-        # enc4 = self.enc4_sw(enc3)
-        center = self.center_sw(self.polling_sw(enc3))
-        # dec4 = self.dec4_sw(torch.cat([F.interpolate(center, enc4.size()[-2:], align_corners=False,
-        #                                           mode='bilinear'), enc4], 1))
-        dec3 = self.dec3_sw(torch.cat([F.interpolate(center, enc3.size()[-2:], align_corners=False,
-                                                  mode='bilinear'), enc3], 1))
-        dec2 = self.dec2_sw(torch.cat([F.interpolate(dec3, enc2.size()[-2:], align_corners=False,
-                                                  mode='bilinear'), enc2], 1))
-        dec1 = self.dec1_sw(torch.cat([F.interpolate(dec2, enc1.size()[-2:], align_corners=False,
-                                                  mode='bilinear'), enc1], 1))
-        xs = self.final_sw(dec1)
-        xs = self.act_sw(xs)
-        xs = 0.2+(0.8-0.2)*xs
-
-        # outputs.append(torch.cat((xp, xs), dim=1))
-        return xp, xs
+        # 生成单输出（压力预测）
+        output = self.final(dec1)
+        output = self.act(output)
+        # 根据三缸泵场景调整输出范围，这里假设仍是压力范围，可根据实际需求修改
+        output = 2000 + (8000 - 2000) * output
